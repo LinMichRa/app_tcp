@@ -4,112 +4,198 @@ import javax.swing.*;
 import org.vinni.Config;
 import java.awt.*;
 import java.io.*;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.net.*;
 import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.*;
 
 public class Servidor extends JFrame {
     private JTextArea logArea;
-    private JTextField puertoField, mensajeField;
-    private JButton iniciarBtn, subirBtn, descargarBtn, enviarMsgBtn, apagarBtn;
-    private ServerSocket serverSocket;
-    private Socket clienteSocket;
-    private DataInputStream in;
-    private DataOutputStream out;
+    private JTextField puertoField;
+    private JButton iniciarBtn, apagarBtn;
+    private ServerSocket tcpServerSocket;
+    private DatagramSocket udpSocket;
+    private ExecutorService threadPool = Executors.newCachedThreadPool();
+    private Map<String, Socket> clientesConectados = new ConcurrentHashMap<>();
+    private Map<String, InetAddress> direccionesUDP = new ConcurrentHashMap<>();
+    private Map<Integer, String> puertosUDP = new ConcurrentHashMap<>();
 
-    private String downloadFolder = Config.get("downloadFolderServidor"); // Archivos recibidos
-    private String uploadFolder = Config.get("uploadFolderServidor");     // Archivos enviados
+    private String downloadFolder = Config.get("downloadFolderServidor");
 
     public Servidor() {
-        setTitle("Servidor");
-        setSize(500, 500);
+        setTitle("Servidor de Chat");
+        setSize(700, 600);
         setDefaultCloseOperation(EXIT_ON_CLOSE);
-        setLayout(null);
+        setLayout(new BorderLayout());
+        setIconImage(new ImageIcon("server_icon.png").getImage());
 
-        JLabel titulo = new JLabel("SERVIDOR", SwingConstants.CENTER);
-        titulo.setFont(new Font("Arial", Font.BOLD, 20));
-        titulo.setBounds(0, 0, 500, 40);
-        add(titulo);
-
-        JLabel puertoLbl = new JLabel("Puerto:");
-        puertoLbl.setBounds(20, 50, 60, 25);
-        add(puertoLbl);
-
-        puertoField = new JTextField();
-        puertoField.setBounds(80, 50, 100, 25);
-        add(puertoField);
-
-        iniciarBtn = new JButton("Iniciar");
-        iniciarBtn.setBounds(200, 50, 100, 25);
+        // Panel superior
+        JPanel topPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 10));
+        topPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        
+        JLabel puertoLbl = new JLabel("Puerto TCP:");
+        puertoField = new JTextField("12345", 6);
+        
+        iniciarBtn = new JButton("Iniciar Servidor", new ImageIcon("start_icon.png"));
         iniciarBtn.addActionListener(e -> iniciarServidor());
-        add(iniciarBtn);
-
-        apagarBtn = new JButton("Apagar");
-        apagarBtn.setBounds(310, 50, 100, 25);
-        apagarBtn.addActionListener(e -> apagarServidor());
+        
+        apagarBtn = new JButton("Apagar", new ImageIcon("stop_icon.png"));
         apagarBtn.setEnabled(false);
-        add(apagarBtn);
-
-        subirBtn = new JButton("Enviar archivo");
-        subirBtn.setBounds(20, 90, 150, 25);
-        subirBtn.addActionListener(e -> enviarArchivo());
-        subirBtn.setEnabled(false);
-        add(subirBtn);
-
-        descargarBtn = new JButton("Recibir archivo");
-        descargarBtn.setBounds(200, 90, 150, 25);
-        descargarBtn.addActionListener(e -> recibirArchivo());
-        descargarBtn.setEnabled(false);
-        add(descargarBtn);
-
-        mensajeField = new JTextField();
-        mensajeField.setBounds(20, 130, 250, 25);
-        add(mensajeField);
-
-        enviarMsgBtn = new JButton("Enviar mensaje");
-        enviarMsgBtn.setBounds(280, 130, 150, 25);
-        enviarMsgBtn.addActionListener(e -> enviarMensaje());
-        enviarMsgBtn.setEnabled(false);
-        add(enviarMsgBtn);
-
+        apagarBtn.addActionListener(e -> apagarServidor());
+        
+        topPanel.add(puertoLbl);
+        topPanel.add(puertoField);
+        topPanel.add(iniciarBtn);
+        topPanel.add(apagarBtn);
+        
+        // Área de logs
         logArea = new JTextArea();
         logArea.setEditable(false);
         JScrollPane scroll = new JScrollPane(logArea);
-        scroll.setBounds(20, 170, 450, 270);
-        add(scroll);
+        scroll.setBorder(BorderFactory.createTitledBorder("Registro de Actividad"));
+        
+        add(topPanel, BorderLayout.NORTH);
+        add(scroll, BorderLayout.CENTER);
     }
 
     private void iniciarServidor() {
         try {
             int puerto = Integer.parseInt(puertoField.getText());
-            serverSocket = new ServerSocket(puerto);
-            log("Servidor iniciado en puerto " + puerto);
+            
+            // Iniciar TCP
+            tcpServerSocket = new ServerSocket(puerto);
+            threadPool.submit(this::manejarConexionesTCP);
+            
+            // Iniciar UDP
+            udpSocket = new DatagramSocket(puerto + 1);
+            threadPool.submit(this::manejarConexionesUDP);
+            
+            log("Servidor iniciado en TCP:" + puerto + " UDP:" + (puerto + 1));
             iniciarBtn.setEnabled(false);
             apagarBtn.setEnabled(true);
-
-            new Thread(() -> {
-                try {
-                    clienteSocket = serverSocket.accept();
-                    log("Cliente conectado");
-                    in = new DataInputStream(clienteSocket.getInputStream());
-                    out = new DataOutputStream(clienteSocket.getOutputStream());
-                    habilitarControles(true);
-                    escucharMensajes();
-                } catch (IOException e) {
-                    log("Error: " + e.getMessage());
-                }
-            }).start();
         } catch (Exception e) {
             log("Error iniciando servidor: " + e.getMessage());
         }
     }
 
+    private void manejarConexionesTCP() {
+        try {
+            while (!tcpServerSocket.isClosed()) {
+                Socket clienteSocket = tcpServerSocket.accept();
+                threadPool.submit(() -> manejarClienteTCP(clienteSocket));
+            }
+        } catch (IOException e) {
+            if (!tcpServerSocket.isClosed()) {
+                log("Error TCP: " + e.getMessage());
+            }
+        }
+    }
+
+    private void manejarClienteTCP(Socket socket) {
+        try (DataInputStream in = new DataInputStream(socket.getInputStream());
+             DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
+            
+            String username = in.readUTF();
+            clientesConectados.put(username, socket);
+            log("Cliente conectado: " + username);
+            broadcastUsuarios();
+            
+            while (true) {
+                String tipo = in.readUTF();
+                switch (tipo) {
+                    case "MSG":
+                        String destino = in.readUTF();
+                        String mensaje = in.readUTF();
+                        enviarMensajeTCP(destino, username, mensaje);
+                        break;
+                    case "FILE":
+                        String fileDest = in.readUTF();
+                        String fileName = in.readUTF();
+                        long fileSize = in.readLong();
+                        recibirArchivoTCP(in, fileDest, fileName, fileSize);
+                        break;
+                    case "UDP_INFO":
+                        int puertoUDP = in.readInt();
+                        direccionesUDP.put(username, socket.getInetAddress());
+                        puertosUDP.put(puertoUDP, username);
+                        log("Cliente " + username + " listo para UDP en puerto " + puertoUDP);
+                        break;
+                }
+            }
+        } catch (IOException e) {
+            log("Cliente desconectado: " + socket.getInetAddress());
+        }
+    }
+
+    private void manejarConexionesUDP() {
+    byte[] buffer = new byte[65535];
+    try {
+        while (true) {
+            DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+            udpSocket.receive(packet);
+            
+            try {
+                ByteArrayInputStream bais = new ByteArrayInputStream(packet.getData(), 0, packet.getLength());
+                DataInputStream dis = new DataInputStream(bais);
+                
+                String tipo = dis.readUTF();
+                String destino = dis.readUTF();
+                String remitente = dis.readUTF();
+                String fileName = dis.readUTF();
+                long fileSize = dis.readLong();
+                
+                // Calculamos el tamaño de los datos efectivos
+                int dataLength = packet.getLength() - (dis.available() + 
+                    tipo.getBytes().length + destino.getBytes().length + 
+                    remitente.getBytes().length + fileName.getBytes().length + 8);
+                
+                threadPool.submit(() -> 
+                    manejarArchivoUDP(dis, destino, remitente, fileName, fileSize, dataLength)
+                );
+            } catch (IOException e) {
+                log("Error procesando paquete UDP: " + e.getMessage());
+            }
+        }
+    } catch (IOException e) {
+        if (!udpSocket.isClosed()) {
+            log("Error en conexión UDP: " + e.getMessage());
+        }
+    }
+    }
+
+    private void enviarMensajeTCP(String destino, String remitente, String mensaje) {
+        try {
+            Socket socketDest = clientesConectados.get(destino);
+            if (socketDest != null) {
+                DataOutputStream out = new DataOutputStream(socketDest.getOutputStream());
+                out.writeUTF("MSG");
+                out.writeUTF(remitente);
+                out.writeUTF(mensaje);
+            }
+        } catch (IOException e) {
+            log("Error enviando mensaje: " + e.getMessage());
+        }
+    }
+
+    private void broadcastUsuarios() {
+        String usuarios = String.join(",", clientesConectados.keySet());
+        for (Socket socket : clientesConectados.values()) {
+            try {
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                out.writeUTF("USERLIST");
+                out.writeUTF(usuarios);
+            } catch (IOException e) {
+                log("Error enviando lista de usuarios: " + e.getMessage());
+            }
+        }
+    }
+
     private void apagarServidor() {
         try {
-            if (clienteSocket != null && !clienteSocket.isClosed()) clienteSocket.close();
-            if (serverSocket != null && !serverSocket.isClosed()) serverSocket.close();
+            if (tcpServerSocket != null) tcpServerSocket.close();
+            if (udpSocket != null) udpSocket.close();
+            threadPool.shutdown();
             log("Servidor apagado");
-            habilitarControles(false);
             iniciarBtn.setEnabled(true);
             apagarBtn.setEnabled(false);
         } catch (IOException e) {
@@ -117,73 +203,132 @@ public class Servidor extends JFrame {
         }
     }
 
-    private void habilitarControles(boolean estado) {
-        subirBtn.setEnabled(estado);
-        descargarBtn.setEnabled(estado);
-        enviarMsgBtn.setEnabled(estado);
-    }
-
-    private void escucharMensajes() {
-        try {
-            while (true) {
-                String msg = in.readUTF();
-                if (msg.startsWith("FILE:")) {
-                    String fileName = msg.substring(5);
-                    int length = in.readInt();
-                    byte[] data = new byte[length];
-                    in.readFully(data);
-                    Path dest = Paths.get(downloadFolder, fileName);
-                    Files.write(dest, data);
-                    log("Archivo recibido: " + fileName);
-                } else {
-                    log("Cliente: " + msg);
-                }
-            }
-        } catch (IOException e) {
-            log("Conexión cerrada");
-            habilitarControles(false);
-        }
-    }
-
-    private void enviarMensaje() {
-        try {
-            out.writeUTF(mensajeField.getText());
-            log("Servidor: " + mensajeField.getText());
-            mensajeField.setText("");
-        } catch (IOException e) {
-            log("Error enviando mensaje: " + e.getMessage());
-        }
-    }
-
-    private void enviarArchivo() {
-        try {
-            JFileChooser fc = new JFileChooser(uploadFolder);
-            if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-                File file = fc.getSelectedFile();
-                out.writeUTF("FILE:" + file.getName());
-                byte[] data = Files.readAllBytes(file.toPath());
-                out.writeInt(data.length);
-                out.write(data);
-                log("Archivo enviado: " + file.getName());
-            }
-        } catch (IOException e) {
-            log("Error enviando archivo: " + e.getMessage());
-        }
-    }
-
-    private void recibirArchivo() {
-        try {
-            // Se maneja en escucharMensajes()
-        } catch (Exception e) {
-            log("Error recibiendo archivo: " + e.getMessage());
-        }
-    }
-
     private void log(String msg) {
-        logArea.append(msg + "\n");
+        SwingUtilities.invokeLater(() -> 
+            logArea.append("[" + new Date() + "] " + msg + "\n")
+        );
     }
+
+    private void recibirArchivoTCP(DataInputStream in, String destino, String fileName, long fileSize) {
+    try {
+        Path destPath = Paths.get(downloadFolder, fileName);
+        
+        // Evitar sobrescribir archivos existentes
+        int counter = 1;
+        String originalName = fileName;
+        while (Files.exists(destPath)) {
+            int dotIndex = originalName.lastIndexOf('.');
+            String name = dotIndex > 0 ? originalName.substring(0, dotIndex) : originalName;
+            String ext = dotIndex > 0 ? originalName.substring(dotIndex) : "";
+            fileName = name + "(" + counter + ")" + ext;
+            destPath = Paths.get(downloadFolder, fileName);
+            counter++;
+        }
+
+        // Recibir el archivo en chunks
+        try (FileOutputStream fos = new FileOutputStream(destPath.toFile())) {
+            byte[] buffer = new byte[4096];
+            long remaining = fileSize;
+            while (remaining > 0) {
+                int read = in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                fos.write(buffer, 0, read);
+                remaining -= read;
+            }
+        }
+
+        log("Archivo recibido de " + destino + ": " + fileName);
+        
+        // Reenviar al destinatario si está conectado
+        Socket destSocket = clientesConectados.get(destino);
+        if (destSocket != null) {
+            try {
+                DataOutputStream destOut = new DataOutputStream(destSocket.getOutputStream());
+                destOut.writeUTF("FILE");
+                destOut.writeUTF(destino); // Remitente original
+                destOut.writeUTF(fileName);
+                destOut.writeLong(fileSize);
+                
+                try (FileInputStream fis = new FileInputStream(destPath.toFile())) {
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    while ((bytesRead = fis.read(buffer)) != -1) {
+                        destOut.write(buffer, 0, bytesRead);
+                    }
+                }
+                log("Archivo reenviado a " + destino);
+            } catch (IOException e) {
+                log("Error reenviando archivo a " + destino);
+            }
+        }
+    } catch (IOException e) {
+        log("Error recibiendo archivo: " + e.getMessage());
+    }
+}
+
+private void manejarArchivoUDP(DataInputStream dis, String destino, String remitente, 
+                             String fileName, long fileSize, int dataLength) {
+    try {
+        // Verificar si el destinatario existe
+        if (!clientesConectados.containsKey(destino)) {
+            log("Destinatario " + destino + " no encontrado para archivo UDP");
+            return;
+        }
+
+        // Crear directorio de descargas si no existe
+        Path downloadDir = Paths.get(downloadFolder);
+        if (!Files.exists(downloadDir)) {
+            Files.createDirectories(downloadDir);
+        }
+
+        // Generar nombre único para el archivo
+        Path destPath = downloadDir.resolve(fileName);
+        int counter = 1;
+        String baseName = fileName.substring(0, fileName.lastIndexOf('.'));
+        String extension = fileName.substring(fileName.lastIndexOf('.'));
+        
+        while (Files.exists(destPath)) {
+            fileName = baseName + "(" + counter + ")" + extension;
+            destPath = downloadDir.resolve(fileName);
+            counter++;
+        }
+
+        // Escribir el archivo
+        try (FileOutputStream fos = new FileOutputStream(destPath.toFile())) {
+            byte[] fileData = new byte[dataLength];
+            dis.readFully(fileData);
+            fos.write(fileData);
+        }
+
+        log("Archivo UDP recibido de " + remitente + ": " + fileName + " (" + 
+            (dataLength/1024) + " KB)");
+        
+        // Notificar al destinatario
+        Socket destSocket = clientesConectados.get(destino);
+        if (destSocket != null && !destSocket.isClosed()) {
+            try {
+                DataOutputStream destOut = new DataOutputStream(destSocket.getOutputStream());
+                destOut.writeUTF("UDP_FILE");
+                destOut.writeUTF(remitente);
+                destOut.writeUTF(fileName);
+                destOut.writeLong(fileSize);
+                destOut.writeUTF(destPath.toString());
+                log("Notificado a " + destino + " sobre archivo UDP");
+            } catch (IOException e) {
+                log("Error notificando a " + destino + ": " + e.getMessage());
+            }
+        }
+    } catch (IOException e) {
+        log("Error procesando archivo UDP: " + e.getMessage());
+    } finally {
+        try {
+            dis.close();
+        } catch (IOException e) {
+            log("Error cerrando stream: " + e.getMessage());
+        }
+    }
+}
 
     public static void main(String[] args) {
-        new Servidor().setVisible(true);
+        SwingUtilities.invokeLater(() -> new Servidor().setVisible(true));
     }
 }
